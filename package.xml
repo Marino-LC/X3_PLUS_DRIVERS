@@ -25,4 +25,9 @@
   <!-- Si vas a lanzar collision_monitor/rf2o desde el launch de este paquete: -->
   <exec_depend>nav2_collision_monitor</exec_depend>
   <exec_depend>rf2o_laser_odometry</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>xacro</exec_depend>
+  <exec_depend>omni_dofbot_description</exec_depend>
+  <exec_depend>ydlidar_ros2_driver</exec_depend>
+  <exec_depend>rf2o_laser_odometry</exec_depend>
 </package>
