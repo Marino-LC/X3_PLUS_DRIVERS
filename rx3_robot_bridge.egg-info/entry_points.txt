@@ -1,0 +1,3 @@
+[console_scripts]
+rosmaster_bridge = rx3_robot_bridge.rosmaster_bridge_node:main
+
