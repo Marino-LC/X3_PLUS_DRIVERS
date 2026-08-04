@@ -59,11 +59,11 @@ class RosmasterBridgeNode(Node):
 
         # ── Parámetros ROS ──────────────────────────────────────────────
         self.declare_parameter('car_type', 1)
-        self.declare_parameter('com', '/dev/ttyUSB0')
+        self.declare_parameter('com', '/dev/ttyCH341USB1')
         self.declare_parameter('baudrate', 115200)
-        self.declare_parameter('kp', 0.8)
-        self.declare_parameter('ki', 0.06)
-        self.declare_parameter('kd', 0.5)
+        self.declare_parameter('kp', 1.0)
+        self.declare_parameter('ki', 0.0)
+        self.declare_parameter('kd', 0.0)
 
         self.add_on_set_parameters_callback(self._on_params_change)
 

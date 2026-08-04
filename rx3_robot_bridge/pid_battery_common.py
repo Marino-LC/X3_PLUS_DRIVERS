@@ -25,8 +25,8 @@ from dataclasses import dataclass, field
 from typing import List
 
 # ── Distancias / ángulos de prueba ────────────────────────────────────────
-DIST_X      = 0.80
-DIST_RETURN = 0.35
+DIST_X      = 0.40
+DIST_RETURN = 0.10
 ROT_ANGLE   = math.pi / 2
 
 # ── Velocidades de referencia ─────────────────────────────────────────────

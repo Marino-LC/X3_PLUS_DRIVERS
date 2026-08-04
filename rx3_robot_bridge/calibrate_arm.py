@@ -105,7 +105,7 @@ class ArmCalibrator:
 
 def main(args=None):
     parser = argparse.ArgumentParser(description="Calibración interactiva del brazo Dofbot")
-    parser.add_argument('--com', default='/dev/ttyUSB0', help='Puerto serie del RosBoard')
+    parser.add_argument('--com', default='/dev/ttyCH341USB0', help='Puerto serie del RosBoard')
     parser.add_argument('--car_type', type=int, default=1, help='Tipo de coche (1=X3, 2=X3PLUS, 5=R2)')
     args = parser.parse_args()
 

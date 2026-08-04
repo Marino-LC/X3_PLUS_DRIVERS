@@ -3,6 +3,7 @@
 hw_pid_battery.py
 ==================
 Batería de pruebas P1/P2/P3 sobre el ROSMASTER X3 PLUS físico.
+Con Paro de Emergencia por colisión (LIDAR) y manual (Ctrl+X).
 """
 
 import os
@@ -10,6 +11,10 @@ import math
 import time
 import json
 import threading
+import sys
+import select
+import termios
+import tty
 from dataclasses import dataclass, field
 from typing import List
 
@@ -24,6 +29,7 @@ from builtin_interfaces.msg import Duration
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
+from sensor_msgs.msg import LaserScan  # <-- NUEVO: Importar LaserScan para el LIDAR
 
 from rx3_robot_bridge.pid_battery_common import (
     DIST_X, DIST_RETURN, ROT_ANGLE, VX_REF, WZ_REF,
@@ -37,6 +43,11 @@ from rx3_robot_bridge.pid_battery_common import (
 BRIDGE_PARAM_SERVICE = "/rosmaster_bridge_node/set_parameters"
 OUT_JSON = "hw_battery_results.json"
 
+# Configuración del LIDAR para el E-Stop
+MIN_SAFE_DIST = 0.35  # Distancia mínima permitida (en metros)
+FRONT_CONE_DEG = 30.0 # Checar +- 30 grados frente al robot
+ROBOT_FOOTPRINT_RADIUS = 0.18 
+MIN_OBSTACLE_RAYS = 4
 
 class HardwareBatteryEvaluator(Node):
     def __init__(self):
@@ -62,12 +73,87 @@ class HardwareBatteryEvaluator(Node):
         self._start_eval_t = 0.0
         self._last_odom_t = 0.0
         self._arm_active = False
+        
+        # <-- NUEVO: Bandera de paro de emergencia
+        self._e_stop = False 
 
+        # Suscripción a Odometría
         self.create_subscription(
             Odometry, "/odom", self._odom_cb, qos_profile_sensor_data,
             callback_group=cbg)
 
+        # <-- NUEVO: Suscripción a LIDAR
+        self.create_subscription(
+            LaserScan, "/scan", self._scan_cb, qos_profile_sensor_data,
+            callback_group=cbg)
+
+        # <-- NUEVO: Hilo para escuchar teclado (Ctrl+X)
+        self._kb_thread = threading.Thread(target=self._keyboard_listener, daemon=True)
+        self._kb_thread.start()
+
         self.get_logger().info("HardwareBatteryEvaluator listo.")
+        self.get_logger().info("==========================================")
+        self.get_logger().info(" PRESIONA [Ctrl+X] PARA PARO DE EMERGENCIA")
+        self.get_logger().info("==========================================")
+
+    # <-- NUEVO: Función para detonar el Paro de Emergencia
+    def _trigger_e_stop(self, reason: str):
+        with self._lock:
+            if self._e_stop:
+                return # Ya estaba activado
+            self._e_stop = True
+            
+        self.get_logger().error(f"\n PARO DE EMERGENCIA ACTIVADO: {reason} \n")
+        
+        # Detener motores de base inmediatamente
+        msg = Twist()
+        self._cmd_pub.publish(msg)
+        
+        # Detener el brazo si estaba activo
+        self._arm_active = False
+
+    # <-- NUEVO: Callback del LIDAR
+    # ── Callback del LIDAR Modificado ──────────────────────────────────────
+    def _scan_cb(self, msg: LaserScan):
+        if self._e_stop:
+            return # Ignorar si ya estamos en paro
+            
+        obstacle_rays_count = 0
+        
+        # Revisar el escaneo frontal
+        for i, r in enumerate(msg.ranges):
+            # 1er Filtro: Ignorar lecturas nulas, infinitas o dentro de la "huella" del robot (el brazo)
+            if math.isinf(r) or math.isnan(r) or r < ROBOT_FOOTPRINT_RADIUS:
+                continue
+                
+            angle = msg.angle_min + i * msg.angle_increment
+            # Normalizar el ángulo a [-pi, pi] (0 es el frente del robot)
+            angle = (angle + math.pi) % (2 * math.pi) - math.pi
+            
+            # Checar si el ángulo está dentro del cono frontal definido
+            if abs(angle) < math.radians(FRONT_CONE_DEG):
+                if r < MIN_SAFE_DIST:
+                    obstacle_rays_count += 1
+                    
+                    # 2do Filtro: ¿El objeto es lo suficientemente grueso para ser real?
+                    if obstacle_rays_count >= MIN_OBSTACLE_RAYS:
+                        self._trigger_e_stop(f"Colisión inminente (Obstáculo detectado a {r:.2f}m)")
+                        break
+
+    # <-- NUEVO: Hilo esclucha del teclado
+    def _keyboard_listener(self):
+        old_settings = termios.tcgetattr(sys.stdin)
+        try:
+            tty.setcbreak(sys.stdin.fileno())
+            while rclpy.ok() and not self._e_stop:
+                # Esperar entrada por 0.1s para no bloquear el hilo infinitamente
+                if select.select([sys.stdin], [], [], 0.1)[0]:
+                    c = sys.stdin.read(1)
+                    if c == '\x18': # Código ASCII para Ctrl+X
+                        self._trigger_e_stop("Activado manualmente (Ctrl+X)")
+                        break
+        finally:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
 
     # ── Odometría ──────────────────────────────────────────────────────────
     def _odom_cb(self, msg: Odometry):
@@ -140,17 +226,26 @@ class HardwareBatteryEvaluator(Node):
 
     # ── Reset manual ──────────────────────────────────────────────────────
     def _manual_reset(self):
+        if self._e_stop: return # Ignorar si hay paro activo
         self._stop()
         time.sleep(0.2)
-        input(
-            "\n>>> Reposiciona el robot manualmente sobre la marca de "
-            "origen (orientación incluida) y presiona ENTER para continuar..."
-        )
+        print("\n>>> Reposiciona el robot manualmente sobre la marca de origen (orientación incluida)")
+        # Evitar usar input() plano para no romper con nuestro hilo de termios
+        print(">>> Presiona ENTER para continuar... (o Ctrl+X para abortar)")
+        while not self._e_stop:
+            if select.select([sys.stdin], [], [], 0.1)[0]:
+                c = sys.stdin.read(1)
+                if c == '\n' or c == '\r':
+                    break
         time.sleep(0.5)
         self._fix_origin()
 
     # ── Primitivas de movimiento ──────────────────────────────────────────
     def _send(self, vx=0.0, vy=0.0, wz=0.0):
+        # <-- MODIFICADO: Bloquear envío de velocidades si hay paro
+        if self._e_stop:
+            vx, vy, wz = 0.0, 0.0, 0.0
+            
         with self._lock:
             self._current_vref = (vx, vy, wz)
         msg = Twist()
@@ -175,6 +270,11 @@ class HardwareBatteryEvaluator(Node):
         t0, ok, aborted = time.time(), False, False
 
         while time.time() - t0 < timeout:
+            # <-- MODIFICADO: Romper bucle si hay paro de emergencia
+            if self._e_stop:
+                aborted = True
+                break
+                
             p = self._get_pose()
             dx, dy = p.x - p0.x, p.y - p0.y
             traveled = (dx*math.cos(p0.yaw) + dy*math.sin(p0.yaw)
@@ -211,6 +311,10 @@ class HardwareBatteryEvaluator(Node):
         self._start_itae(target, slog)
 
         while time.time() - t0 < timeout:
+            # <-- MODIFICADO: Romper bucle si hay paro de emergencia
+            if self._e_stop:
+                break
+                
             p = self._get_pose()
             diff = (goal_yaw - p.yaw + math.pi) % (2*math.pi) - math.pi
             if abs(diff) <= YAW_TOL:
@@ -255,6 +359,7 @@ class HardwareBatteryEvaluator(Node):
 
     # ── Brazo ──────────────────────────────────────────────────────────────
     def _send_arm(self, positions, duration_sec=ARM_MOVE_DUR):
+        if self._e_stop: return
         msg = JointTrajectory()
         msg.joint_names = ARM_JOINTS
         pt = JointTrajectoryPoint()
@@ -264,6 +369,7 @@ class HardwareBatteryEvaluator(Node):
         self._arm_pub.publish(msg)
 
     def _send_grip(self, position, duration_sec=ARM_MOVE_DUR):
+        if self._e_stop: return
         msg = JointTrajectory()
         msg.joint_names = GRIP_JOINTS
         pt = JointTrajectoryPoint()
@@ -274,37 +380,33 @@ class HardwareBatteryEvaluator(Node):
 
     def _wait_arm(self, duration_sec):
         t0 = time.time()
-        while self._arm_active and time.time()-t0 < duration_sec:
+        while self._arm_active and not self._e_stop and time.time()-t0 < duration_sec:
             time.sleep(0.05)
-        return self._arm_active
+        return self._arm_active and not self._e_stop
 
     def _arm_loop(self):
         side = "left"
-        while self._arm_active:
+        while self._arm_active and not self._e_stop:
             pick = ARM_PICK_LEFT if side == "left" else ARM_PICK_RIGHT
             place = ARM_PICK_RIGHT if side == "left" else ARM_PICK_LEFT
             self._send_arm(pick)
             self._send_grip(GRIP_OPEN)
-            if not self._wait_arm(ARM_MOVE_DUR + ARM_HOLD_DUR):
-                break
+            if not self._wait_arm(ARM_MOVE_DUR + ARM_HOLD_DUR): break
             self._send_grip(GRIP_CLOSED)
-            if not self._wait_arm(ARM_HOLD_DUR):
-                break
+            if not self._wait_arm(ARM_HOLD_DUR): break
             self._send_arm(ARM_HOME)
-            if not self._wait_arm(ARM_MOVE_DUR + ARM_HOLD_DUR):
-                break
+            if not self._wait_arm(ARM_MOVE_DUR + ARM_HOLD_DUR): break
             self._send_arm(place)
-            if not self._wait_arm(ARM_MOVE_DUR + ARM_HOLD_DUR):
-                break
+            if not self._wait_arm(ARM_MOVE_DUR + ARM_HOLD_DUR): break
             self._send_grip(GRIP_OPEN)
-            if not self._wait_arm(ARM_HOLD_DUR):
-                break
+            if not self._wait_arm(ARM_HOLD_DUR): break
             self._send_arm(ARM_HOME)
-            if not self._wait_arm(ARM_MOVE_DUR + ARM_HOLD_DUR):
-                break
+            if not self._wait_arm(ARM_MOVE_DUR + ARM_HOLD_DUR): break
             side = "right" if side == "left" else "left"
-        self._send_arm(ARM_HOME)
-        self._send_grip(GRIP_OPEN)
+            
+        if not self._e_stop:
+            self._send_arm(ARM_HOME)
+            self._send_grip(GRIP_OPEN)
 
     def _start_arm(self):
         self._arm_active = True
@@ -313,61 +415,67 @@ class HardwareBatteryEvaluator(Node):
 
     def _stop_arm(self):
         self._arm_active = False
-        if hasattr(self, "_arm_thread"):
+        if hasattr(self, "_arm_thread") and self._arm_thread.is_alive():
             self._arm_thread.join(timeout=ARM_MOVE_DUR + 1.0)
 
     # ── Pruebas ────────────────────────────────────────────────────────────
     def _run_test1(self):
+        if self._e_stop: return 0.0, []
         self.get_logger().info("── P1: línea recta adelante-atrás ──")
         self._manual_reset()
+        if self._e_stop: return 0.0, []
         try:
             i1, t1, ok1, s1 = self._drive(DIST_X, "x", vx=+VX_REF, seg_name="P1_adelante")
             i2, t2, ok2, s2 = self._drive(-DIST_X, "x", vx=-VX_REF, seg_name="P1_atras")
         finally:
             pass
+        if self._e_stop: return 0.0, []
         rel = self._pose_rel()
         err_f = math.hypot(rel.x, rel.y)
         ITAE_REF, TIME_REF = 0.05, 2*DIST_X/VX_REF
         cost = 0.60*(i1+i2)/ITAE_REF + 0.30*(t1+t2)/TIME_REF + 0.10*err_f/POS_TOL
-        if not ok1 or not ok2:
-            cost += PENALTY_TO
+        if not ok1 or not ok2: cost += PENALTY_TO
         self.get_logger().info(f"   ITAE={i1+i2:.4f} cost={cost:.4f}")
         return cost, [s1, s2]
 
     def _run_test2(self):
+        if self._e_stop: return 0.0, []
         self.get_logger().info("── P2: rotación pura +90°/-90° ──")
         self._manual_reset()
+        if self._e_stop: return 0.0, []
         try:
             e1, ok1, s1, t1 = self._rotate(+ROT_ANGLE, seg_name="P2_giro_horario")
             e2, ok2, s2, t2 = self._rotate(-ROT_ANGLE, seg_name="P2_giro_antihorario")
         finally:
             pass
+        if self._e_stop: return 0.0, []
         rel = self._pose_rel()
         err_f = math.hypot(rel.x, rel.y)
         TIME_REF = 2*ROT_ANGLE/WZ_REF
         cost = 0.55*(e1+e2)/(2*YAW_TOL) + 0.25*(t1+t2)/TIME_REF + 0.20*err_f/POS_TOL
-        if not ok1 or not ok2:
-            cost += PENALTY_TO
+        if not ok1 or not ok2: cost += PENALTY_TO
         self.get_logger().info(f"   err_yaw={math.degrees(e1+e2):.1f}° cost={cost:.4f}")
         return cost, [s1, s2]
 
     def _run_test3(self):
+        if self._e_stop: return 0.0, []
         self.get_logger().info("── P3: avance + giro + regreso ──")
         self._manual_reset()
+        if self._e_stop: return 0.0, []
         try:
             i1, t1, ok1, s1 = self._drive(DIST_X, "x", vx=+VX_REF, seg_name="P3_adelante")
             ey, okr, sr, tr = self._rotate(-ROT_ANGLE, seg_name="P3_giro")
             i2, t2, ok2, s2 = self._drive(DIST_RETURN, "x", vx=+VX_REF, seg_name="P3_regreso")
         finally:
             pass
+        if self._e_stop: return 0.0, []
         rel = self._pose_rel()
         err_f = math.hypot(rel.x, rel.y)
         ITAE_REF = 0.08
         TIME_REF = (DIST_X/VX_REF) + (ROT_ANGLE/WZ_REF) + (DIST_RETURN/VX_REF)
         cost = (0.45*(i1+i2)/ITAE_REF + 0.20*(t1+t2)/TIME_REF
                 + 0.15*ey/YAW_TOL + 0.20*err_f/POS_TOL)
-        if not ok1 or not ok2 or not okr:
-            cost += PENALTY_TO
+        if not ok1 or not ok2 or not okr: cost += PENALTY_TO
         self.get_logger().info(f"   err_yaw={math.degrees(ey):.1f}° cost={cost:.4f}")
         return cost, [s1, sr, s2]
 
@@ -382,6 +490,10 @@ class HardwareBatteryEvaluator(Node):
             c3, segs3 = self._run_test3()
         finally:
             self._stop_arm()
+            
+        if self._e_stop:
+            raise Exception("Ejecución interrumpida por E-Stop")
+            
         fitness = W1*c1 + W2*c2 + W3*c3
         return fitness, (c1, c2, c3), (segs1, segs2, segs3)
 
@@ -412,11 +524,11 @@ def _seg_to_dict(s: SegmentLog) -> dict:
 def main(args=None):
     rclpy.init(args=args)
     node = HardwareBatteryEvaluator()
-
+    
     node.declare_parameter("label", "unnamed")
-    node.declare_parameter("kp", 1.0)
-    node.declare_parameter("ki", 0.0)
-    node.declare_parameter("kd", 0.0)
+    node.declare_parameter("kp", 1.5)
+    node.declare_parameter("ki", 0.08)
+    node.declare_parameter("kd", 0.5)
     node.declare_parameter("reps", 5)
 
     label = node.get_parameter("label").value
@@ -437,8 +549,15 @@ def main(args=None):
             f"{reps} repeticiones ===")
         runs = []
         for r in range(reps):
+            if node._e_stop: break # Salir si el paro está activo
             node.get_logger().info(f"--- Repetición {r+1}/{reps} ---")
-            fitness, costs, segs = node.run_once(kp, ki, kd)
+            
+            try:
+                fitness, costs, segs = node.run_once(kp, ki, kd)
+            except Exception as e:
+                node.get_logger().error(str(e))
+                break
+                
             runs.append({
                 "rep": r,
                 "fitness": fitness,
@@ -452,26 +571,27 @@ def main(args=None):
                 },
             })
 
-        fitnesses = [r["fitness"] for r in runs]
-        mean_fit = sum(fitnesses) / len(fitnesses)
-        std_fit = (sum((f-mean_fit)**2 for f in fitnesses) / len(fitnesses)) ** 0.5
+        if runs:
+            fitnesses = [r["fitness"] for r in runs]
+            mean_fit = sum(fitnesses) / len(fitnesses)
+            std_fit = (sum((f-mean_fit)**2 for f in fitnesses) / len(fitnesses)) ** 0.5
 
-        results = {
-            "label": label,
-            "kp": kp,
-            "ki": ki,
-            "kd": kd,
-            "reps": reps,
-            "mean_fitness": mean_fit,
-            "std_fitness": std_fit,
-            "runs": runs,
-        }
-        out_path = os.path.abspath(f"{label}_{OUT_JSON}")
-        with open(out_path, "w") as f:
-            json.dump(results, f, indent=2)
-        node.get_logger().info(
-            f"=== {label}: fitness medio={mean_fit:.4f} ± {std_fit:.4f} — "
-            f"guardado en {out_path} ===")
+            results = {
+                "label": label,
+                "kp": kp,
+                "ki": ki,
+                "kd": kd,
+                "reps": reps,
+                "mean_fitness": mean_fit,
+                "std_fitness": std_fit,
+                "runs": runs,
+            }
+            out_path = os.path.abspath(f"{label}_{OUT_JSON}")
+            with open(out_path, "w") as f:
+                json.dump(results, f, indent=2)
+            node.get_logger().info(
+                f"=== {label}: fitness medio={mean_fit:.4f} ± {std_fit:.4f} — "
+                f"guardado en {out_path} ===")
     finally:
         executor.shutdown()
         node.destroy_node()
