@@ -49,14 +49,15 @@ def generate_launch_description():
 
     # 3. Driver del LiDAR
     ydlidar_params = os.path.join(
-        get_package_share_directory('ydlidar_ros2_driver'),
-        'params', 'ydlidar.yaml')
+        get_package_share_directory('rx3_robot_bridge'),
+        'config', 'ydlidar_x4.yaml')
 
     ydlidar_node = Node(
         package='ydlidar_ros2_driver',
         executable='ydlidar_ros2_driver_node',
         name='ydlidar_ros2_driver_node',
         output='screen',
+        emulate_tty=True,
         parameters=[ydlidar_params],
     )
 
@@ -82,7 +83,7 @@ def generate_launch_description():
 
     # Construcción final del Launch
     return LaunchDescription([
-        DeclareLaunchArgument('serial_port', default_value='/dev/ttyCH341USB0'),
+        DeclareLaunchArgument('serial_port', default_value='/dev/ttyCH341USB1'),
         robot_state_publisher_node,
         bridge_node,
         ydlidar_node,
