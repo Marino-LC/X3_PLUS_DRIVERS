@@ -65,6 +65,12 @@ class RosmasterBridgeNode(Node):
         self.declare_parameter('ki', 0.0)
         self.declare_parameter('kd', 0.0)
 
+        # ── NUEVO: parámetros de rampa (protección de picos de corriente) ──
+        self.declare_parameter('max_linear_accel', 0.6)   # m/s² — AJUSTAR con medición real de corriente
+        self.declare_parameter('max_angular_accel', 2.0)  # rad/s²
+        self.declare_parameter('ramp_rate_hz', 30.0)       # frecuencia del lazo de rampeo
+
+
         self.add_on_set_parameters_callback(self._on_params_change)
 
         car_type = self.get_parameter('car_type').value
@@ -84,6 +90,19 @@ class RosmasterBridgeNode(Node):
         self.create_subscription(Twist, '/cmd_vel', self._cmd_vel_cb, 10)
         self._watchdog_timer = self.create_timer(0.1, self._watchdog_cb)
 
+        # ── NUEVO: estado de la rampa ──
+        self._ramp_lock = threading.Lock()
+        self._target_vx = 0.0
+        self._target_vy = 0.0
+        self._target_wz = 0.0
+        self._cmd_vx = 0.0   # valor YA rampado, el que de verdad se manda al STM32
+        self._cmd_vy = 0.0
+        self._cmd_wz = 0.0
+
+        # NUEVO: timer de rampeo — corre independiente de cuándo llega /cmd_vel
+        ramp_hz = self.get_parameter('ramp_rate_hz').value
+        self._ramp_dt = 1.0 / ramp_hz
+        self._ramp_timer = self.create_timer(self._ramp_dt, self._ramp_cb)
         # ── Estado del brazo (última pose conocida de CADA canal) ───────
         # CRÍTICO: sin este estado sincronizado, un comando de gripper
         # sobreescribiría el brazo con una pose vieja/cero, y viceversa
@@ -105,12 +124,55 @@ class RosmasterBridgeNode(Node):
     def _cmd_vel_cb(self, msg: Twist):
         with self._lock:
             self._last_cmd_time = time.time()
-        self._bot.set_car_motion(float(msg.linear.x), float(msg.linear.y), float(msg.angular.z))
+        # CAMBIO: ya NO se llama set_car_motion aquí directo.
+        # Solo actualiza el objetivo; _ramp_cb() es quien manda al motor.
+        with self._ramp_lock:
+            self._target_vx = float(msg.linear.x)
+            self._target_vy = float(msg.linear.y)
+            self._target_wz = float(msg.angular.z)
+
+    def _ramp_cb(self):
+        """Lazo de rampeo — corre a ramp_rate_hz, acerca cmd_* a target_*
+        sin exceder max_linear_accel/max_angular_accel, y es quien
+        efectivamente escribe al STM32 vía set_car_motion()."""
+        max_lin_a = self.get_parameter('max_linear_accel').value
+        max_ang_a = self.get_parameter('max_angular_accel').value
+
+        with self._ramp_lock:
+            self._cmd_vx = self._slew(self._cmd_vx, self._target_vx, max_lin_a, self._ramp_dt)
+            self._cmd_vy = self._slew(self._cmd_vy, self._target_vy, max_lin_a, self._ramp_dt)
+            self._cmd_wz = self._slew(self._cmd_wz, self._target_wz, max_ang_a, self._ramp_dt)
+            vx, vy, wz = self._cmd_vx, self._cmd_vy, self._cmd_wz
+
+        self._bot.set_car_motion(vx, vy, wz)
+
+    @staticmethod
+    def _slew(current, target, max_rate, dt):
+        max_delta = max_rate * dt
+        delta = target - current
+        delta = max(-max_delta, min(max_delta, delta))
+        return current + delta
 
     def _watchdog_cb(self):
+        """Si se pierde /cmd_vel, frena INMEDIATO (bypassa la rampa por
+        completo) — esto es una situación de seguridad, no una parada
+        programada, así que aquí se prioriza detener el robot lo antes
+        posible sobre proteger los motores de un pico de corriente."""
         with self._lock:
             stale = (time.time() - self._last_cmd_time) > WATCHDOG_TIMEOUT
         if stale:
+            with self._ramp_lock:
+                # Se resetea TANTO el objetivo como el valor ya rampado,
+                # para que _ramp_cb() no intente "reanudar" hacia el último
+                # target la próxima vez que llegue un /cmd_vel real — sin
+                # este reset, el primer ciclo de rampa post-watchdog partiría
+                # de un _cmd_vx distinto de cero de forma inconsistente.
+                self._target_vx = 0.0
+                self._target_vy = 0.0
+                self._target_wz = 0.0
+                self._cmd_vx = 0.0
+                self._cmd_vy = 0.0
+                self._cmd_wz = 0.0
             self._bot.set_car_motion(0.0, 0.0, 0.0)
 
     # ─── Brazo: conversión radianes → grados servo ──────────────────────
