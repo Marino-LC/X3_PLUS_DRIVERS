@@ -76,9 +76,6 @@ def generate_launch_description():
             'init_pose_from_topic': '',
             'freq': 20.0
         }],
-        ros_arguments=[
-            '--qos-profile-overrides', '/scan:best_effort'
-        ]
     )
 
     # Construcción final del Launch
