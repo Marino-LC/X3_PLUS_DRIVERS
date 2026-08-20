@@ -42,7 +42,7 @@ def generate_launch_description():
         parameters=[{
             'com': LaunchConfiguration('serial_port'),
             'car_type': 1,
-            'kp': 1.5, 'ki': 0.08, 'kd': 0.5,
+            'kp': 2.7340, 'ki': 0.3347, 'kd': 0.7565,
         }],
         output='screen'
     )
@@ -80,7 +80,7 @@ def generate_launch_description():
 
     # Construcción final del Launch
     return LaunchDescription([
-        DeclareLaunchArgument('serial_port', default_value='/dev/ttyCH341USB1'),
+        DeclareLaunchArgument('serial_port', default_value='/dev/ttyCH341USB0'),
         robot_state_publisher_node,
         bridge_node,
         ydlidar_node,

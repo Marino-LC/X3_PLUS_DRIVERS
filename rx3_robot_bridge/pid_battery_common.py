@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from typing import List
 
 # ── Distancias / ángulos de prueba ────────────────────────────────────────
-DIST_X      = 0.40
+DIST_X      = 0.50
 DIST_Y      = 0.20 
 DIST_RETURN = 0.10
 ROT_ANGLE   = math.pi / 2
@@ -38,8 +38,8 @@ WZ_REF = 0.20
 # ── Lazo de control / tolerancias ─────────────────────────────────────────
 CTRL_DT      = 0.05
 SETTLE_TIME  = 0.30
-TIMEOUT_MOVE = 4
-TIMEOUT_ROT  = 4
+TIMEOUT_MOVE = 2
+TIMEOUT_ROT  = 2
 POS_TOL      = 0.04
 YAW_TOL      = 0.05
 MAX_POS_ERROR_ABORT = 1.0
@@ -54,15 +54,15 @@ ARM_JOINTS  = ["arm_joint_01","arm_joint_02","arm_joint_03",
 GRIP_JOINTS = ["grip_joint"]
 ARM_TOPIC   = "/dofbot_trajectory_controller/joint_trajectory"
 GRIP_TOPIC  = "/dofbot_gripper_controller/joint_trajectory"
-ARM_MOVE_DUR = 1
-ARM_HOLD_DUR = 1.0
+ARM_MOVE_DUR = 0.55
+ARM_HOLD_DUR = 0.55
 
 ARM_HOME       = [ 0.00,  0.00,  0.00,  0.00, 1.57]
 ARM_PICK_LEFT  = [-1.20, -1.25, -0.7, -0.3, 1.57]
 ARM_PICK_RIGHT = [ 1.20, -1.25, -0.7, -0.3, 1.57]
 ARM_CHOREOGRAPHY = [(1,4), (3,2), (5,1)]
-GRIP_OPEN   = -0.75
-GRIP_CLOSED = -0.75
+GRIP_OPEN   = -0.95
+GRIP_CLOSED = 0.00
 
 
 @dataclass

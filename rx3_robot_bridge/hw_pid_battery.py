@@ -9,6 +9,7 @@ Con Paro de Emergencia por colisión (LIDAR) y manual (Ctrl+X).
 import os
 import math
 import time
+import subprocess
 import json
 import threading
 import sys
@@ -44,7 +45,7 @@ BRIDGE_PARAM_SERVICE = "/rosmaster_bridge_node/set_parameters"
 OUT_JSON = "hw_battery_results.json"
 
 # Configuración del LIDAR para el E-Stop
-MIN_SAFE_DIST = 0.35  # Distancia mínima permitida (en metros)
+MIN_SAFE_DIST = 0.25  # Distancia mínima permitida (en metros)
 FRONT_CONE_DEG = 30.0 # Checar +- 30 grados frente al robot
 ROBOT_FOOTPRINT_RADIUS = 0.18 
 MIN_OBSTACLE_RAYS = 4
@@ -224,21 +225,100 @@ class HardwareBatteryEvaluator(Node):
             self._seg_log = None
             return self._itae_accum
 
-    # ── Reset manual ──────────────────────────────────────────────────────
+    def _hard_restart_rf2o(self):
+        """
+        Fallback SOLO si es físicamente imposible deslizar el robot sin
+        levantarlo. Reinicia el PROCESO de rf2o_laser_odometry_node con 
+        cierre limpio (SIGINT) y blindaje de tópicos.
+        """
+        self.get_logger().warn(
+            "Reiniciando proceso de rf2o_laser_odometry_node "
+            "(el robot fue levantado, no solo deslizado)..."
+        )
+        
+        # 1. Matamos el proceso con SIGINT (Ctrl+C simulado) en lugar de un kill abrupto.
+        # Vital para que FastDDS avise al YDLidar que se desconectó y libere la memoria compartida.
+        subprocess.run(["pkill", "-INT", "-f", "rf2o_laser_odometry"])
+        
+        # 2. Le damos 2.0 segundos completos al núcleo DDS para purgar sus cachés
+        time.sleep(2.0) 
+        
+        import time as time_module
+        nuevo_nombre = f"rf2o_recovery_{int(time_module.time())}"
+        
+        self.get_logger().info(f"Levantando nueva instancia como: {nuevo_nombre}")
+        
+        # 3. Lanzamos con TODAS las combinaciones posibles de remapeo y parámetros
+        subprocess.Popen([
+            "ros2", "run", "rf2o_laser_odometry", "rf2o_laser_odometry_node",
+            "--ros-args",
+            "-r", f"__node:={nuevo_nombre}",
+            "-r", "scan:=/scan",               # Remapeo blindado A
+            "-r", "laser_scan:=/scan",         # Remapeo blindado B
+            "-p", "laser_scan_topic:=/scan",   # Parámetro estándar de la rama principal
+            "-p", "scan_topic:=/scan",         # Variante de parámetro (otras ramas)
+            "-p", "odom_topic:=/odom",
+            "-p", "publish_tf:=true",
+            "-p", "base_frame_id:=base_footprint",
+            "-p", "odom_frame_id:=odom",
+            "-p", "freq:=12.0",
+        ])
+        
+        self.get_logger().info("Esperando sincronización de /scan al nuevo nodo de odometría...")
+        time.sleep(5.0)
+
+    def _verify_odom_stable(self, timeout=1.0, max_drift=0.05):
+        """
+        Confirma que /odom no sigue derivando con el robot inmóvil.
+        Si falla, es señal de que rf2o no convergió limpiamente.
+        """
+        p0 = self._get_pose()
+        time.sleep(timeout)
+        p1 = self._get_pose()
+        
+        # Calculamos la distancia Euclídea entre la pose 0 y la pose 1
+        # Asegúrate de usar la lógica que coincida con cómo guardas la pose
+        import math
+        drift = math.hypot(p1.x - p0.x, p1.y - p0.y)
+
+        if drift > max_drift:
+            self.get_logger().warn(
+                f"[odom] Deriva de {drift:.3f}m detectada con el robot supuestamente "
+                f"quieto — Posible falla de convergencia en rf2o. "
+                f"Considera reintentar el reposicionamiento."
+            )
+            return False
+            
+        self.get_logger().info("[odom] Odometría estable confirmada.")
+        return True
+
     def _manual_reset(self):
-        if self._e_stop: return # Ignorar si hay paro activo
-        self._stop()
-        time.sleep(0.2)
-        print("\n>>> Reposiciona el robot manualmente sobre la marca de origen (orientación incluida)")
-        # Evitar usar input() plano para no romper con nuestro hilo de termios
-        print(">>> Presiona ENTER para continuar... (o Ctrl+X para abortar)")
-        while not self._e_stop:
-            if select.select([sys.stdin], [], [], 0.1)[0]:
-                c = sys.stdin.read(1)
-                if c == '\n' or c == '\r':
-                    break
-        time.sleep(0.5)
+        """
+        Reposicionamiento puramente matemático. 
+        Ignoramos el salto del LIDAR absorbiéndolo como el nuevo origen.
+        """
+        self.get_logger().info("=== REPOSICIONAMIENTO MANUAL ===")
+        self.get_logger().info("Levanta el robot y acomódalo en su marca de inicio.")
+        
+        # Pausamos el flujo hasta que el operador confirme
+        input("Presiona ENTER cuando el robot esté en el piso y tus piernas estén lejos del LIDAR...")
+        
+        self.get_logger().info("Esperando 3 segundos a que el LIDAR estabilice el entorno...")
+        time.sleep(3.0) 
+        
+        # Validamos que rf2o ya dejó de arrastrar el error
+        estable = self._verify_odom_stable()
+        while not estable:
+            self.get_logger().warn("El LIDAR sigue detectando movimiento fantasma. Aléjate un poco más del robot.")
+            input("Presiona ENTER para reintentar la estabilización...")
+            time.sleep(2.0)
+            estable = self._verify_odom_stable()
+            
+        # El truco maestro: Sobreescribimos el origen.
+        # Cualquier salto gigante que haya dado el LIDAR al levantarlo queda anulado matemáticamente.
         self._fix_origin()
+        
+        self.get_logger().info("=== ORIGEN ACTUALIZADO MATEMÁTICAMENTE. REANUDANDO PRUEBA ===")
 
     # ── Primitivas de movimiento ──────────────────────────────────────────
     def _send(self, vx=0.0, vy=0.0, wz=0.0):
@@ -526,9 +606,9 @@ def main(args=None):
     node = HardwareBatteryEvaluator()
     
     node.declare_parameter("label", "unnamed")
-    node.declare_parameter("kp", 1.5)
-    node.declare_parameter("ki", 0.08)
-    node.declare_parameter("kd", 0.5)
+    node.declare_parameter("kp", 2.534)
+    node.declare_parameter("ki", 0.3347)
+    node.declare_parameter("kd", 0.7565)
     node.declare_parameter("reps", 5)
 
     label = node.get_parameter("label").value
