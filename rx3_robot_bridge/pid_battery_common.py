@@ -25,15 +25,15 @@ from dataclasses import dataclass, field
 from typing import List
 
 # ── Distancias / ángulos de prueba ────────────────────────────────────────
-DIST_X      = 0.50
+DIST_X      = 0.80
 DIST_Y      = 0.20 
-DIST_RETURN = 0.10
+DIST_RETURN = 0.30
 ROT_ANGLE   = math.pi / 2
 
 # ── Velocidades de referencia ─────────────────────────────────────────────
-VX_REF = 0.20
-VY_REF = 0.20
-WZ_REF = 0.20
+VX_REF = 0.4
+VY_REF = 0.10
+WZ_REF = 0.2
 
 # ── Lazo de control / tolerancias ─────────────────────────────────────────
 CTRL_DT      = 0.05

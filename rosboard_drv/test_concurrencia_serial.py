@@ -106,10 +106,10 @@ def main():
         print(f"Tramas corruptas / Errores de colisión: {fallos}")
 
         if fallos == 0:
-            print("\n✅ ÉXITO ABSOLUTO: El bus serial soporta Full-Duplex simulado.")
+            print("\nEl bus serial soporta Full-Duplex simulado.")
         else:
             porcentaje_error = (fallos / lecturas_totales) * 100
-            print(f"\n❌ FALLO DETECTADO (Tasa de error: {porcentaje_error:.1f}%): Necesitarás implementar un Lock (Mutex).")
+            print(f"\nFALLO DETECTADO (Tasa de error: {porcentaje_error:.1f}%): Necesitarás implementar un Lock (Mutex).")
 
 if __name__ == '__main__':
     main()
