@@ -35,7 +35,8 @@ setup(
         'calibrate_arm = rx3_robot_bridge.calibrate_arm:main', 
         'hw_pid_battery = rx3_robot_bridge.hw_pid_battery:main',
         'hw_pid_battery_enc = rx3_robot_bridge.hw_pid_battery_enc:main',
-        'test_concurrencia = rosboard_drv.test_concurrencia_serial:main'
+        'test_concurrencia = rosboard_drv.test_concurrencia_serial:main',
+        'Escalera = rosboard_drv.Prueba_escalonada:prueba_escalonada'
         ],
     },
 )

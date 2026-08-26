@@ -80,7 +80,7 @@ def generate_launch_description():
 
     # Construcción final del Launch
     return LaunchDescription([
-        DeclareLaunchArgument('serial_port', default_value='/dev/ttyCH341USB1'),
+        DeclareLaunchArgument('serial_port', default_value='/dev/ttyCH341USB0'),
         robot_state_publisher_node,
         bridge_node,
         ydlidar_node,

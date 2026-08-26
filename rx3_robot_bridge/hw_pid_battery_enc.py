@@ -5,8 +5,56 @@ hw_pid_battery_encoder.py
 Batería de pruebas P1/P2/P3 sobre el ROSMASTER X3 PLUS físico.
 
 CONTROL: Odometría por Encoders (/odom_encoder)
-SEGURIDAD: Paro de Emergencia Activo (LIDAR /scan < 0.30m y Ctrl+X)
+SEGURIDAD: Paro de Emergencia Activo (LIDAR /scan y Ctrl+X)
 REGISTRO: LIDAR (/odom vía rf2o) en paralelo para comparación.
+
+═══════════════════════════════════════════════════════════════════════════
+CORRECCIONES respecto a la versión anterior (bitácora de fixes)
+═══════════════════════════════════════════════════════════════════════════
+1. E-STOP AHORA VIGILA FRENTE Y ATRÁS, no solo el cono frontal:
+   La versión anterior solo revisaba abs(angle) < E_STOP_HALF_ANGLE (cono
+   frontal). Como P1_atras mueve el robot con vx negativo (hacia atrás),
+   un obstáculo detrás del robot era invisible para el E-stop pese a que
+   el LIDAR sí lo detecta -- el filtro angular lo descartaba. Ahora se
+   vigilan DOS conos fijos (frontal y trasero, ±E_STOP_HALF_ANGLE
+   alrededor de 0 rad y de pi rad), cubriendo ambos sentidos de la
+   batería de pruebas actual (P1 avanza y retrocede; P2 es rotación pura,
+   sin desplazamiento, así que ambos conos cubren igual el punto de giro;
+   P3 combina avance+giro+avance, siempre en +x). No se vigila el cono
+   lateral porque la batería vigente no incluye desplazamiento lateral
+   -- documentado como limitación conocida, igual que el resto de la
+   tesis señala explícitamente sus supuestos de alcance.
+
+2. _manual_reset() ahora revisa self._e_stop DESPUÉS del loop de espera,
+   no solo antes. Si el E-stop se dispara mientras el operador está
+   reposicionando el robot, ya no se procede a resetear /odom_encoder ni
+   a fijar el origen -- evitaría fijar un origen "válido" justo después
+   de una emergencia.
+
+3. _keyboard_monitor() ahora:
+   a) protege termios.tcgetattr() con try/except para no crashear en
+      silencio si stdin no es una tty (p. ej. lanzado desde un archivo
+      launch.py sin terminal interactiva).
+   b) restaura la terminal de forma EXPLÍCITA en el finally de main(),
+      no solo confiando en el finally del hilo daemon (que puede no
+      ejecutarse si el proceso termina de forma abrupta).
+   c) usa una bandera _kb_thread_running explícita para poder unirse al
+      hilo con timeout en shutdown, en vez de depender únicamente de
+      rclpy.ok().
+
+4. run_once() ya no aliasa la misma lista/objeto SegmentLog entre las
+   tres pruebas en sus valores por defecto -- cada una obtiene su propia
+   instancia independiente.
+
+5. _reset_encoder_odom() ahora loggea explícitamente cuando el servicio
+   no está disponible o hace timeout, en vez de fallar en silencio.
+
+6. El costo de aborto total por E-stop ya no es el número mágico
+   "PENALTY_TO * 3": se nombra EMERGENCY_ABORT_COST con un comentario
+   explicando por qué es mayor que un PENALTY_TO simple (representa el
+   fallo simultáneo de las tres pruebas, no de un solo segmento).
+
+7. _scan_cb() ahora descarta mensajes /scan vacíos antes de iterar.
 """
 
 import os
@@ -48,6 +96,44 @@ BRIDGE_PARAM_SERVICE = "/rosmaster_bridge_node/set_parameters"
 BRIDGE_ENC_RESET_SERVICE = "/rosmaster_bridge_node/reset_pose"
 OUT_JSON = "hw_battery_results_encoder_control.json"
 
+# ── Parámetros de seguridad del E-stop ──────────────────────────────────────
+E_STOP_MIN_RANGE = 0.30        # m — distancia mínima antes de frenar
+E_STOP_HALF_ANGLE = 0.52       # rad (~30°) — semiancho del cono frontal vigilado
+E_STOP_FRONT_CENTER = 0.0      # rad
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CORRECCIÓN — el LIDAR NO puede cubrir la parte trasera del chasis
+# ═══════════════════════════════════════════════════════════════════════════
+# Las tarjetas de control montadas en el chasis bloquean físicamente el campo
+# de visión del YDLIDAR TG30 hacia atrás. Un chequeo de "cono trasero" sobre
+# esas lecturas NO detecta obstáculos: detecta las propias tarjetas a muy
+# corta distancia, de forma constante -- lo que dispararía el E-stop en
+# falso desde el arranque del nodo (el chasis siempre estaría a menos de
+# E_STOP_MIN_RANGE en esas lecturas). Por eso:
+#   1. El E-stop automático por LIDAR SOLO vigila el cono frontal.
+#   2. El arco físicamente bloqueado se ENMASCARA (se ignora por completo,
+#      ni siquiera se evalúa) para que esas lecturas de auto-detección no
+#      contaminen ningún chequeo, presente o futuro.
+#   3. La falta de cobertura trasera se compensa con una confirmación visual
+#      MANUAL del operador antes de cada movimiento hacia atrás (único caso
+#      en la batería actual: P1_atras) -- ver _confirm_rear_clear().
+#
+# CALIBRAR EN EL ROBOT FÍSICO: estos valores son un punto de partida
+# razonable, no una medición. Ajustar lidar_blind_arc_center_deg /
+# lidar_blind_arc_halfwidth_deg (parámetros ROS, ver __init__) hasta que el
+# arco cubra exactamente la sombra real de las tarjetas de control sobre el
+# barrido del TG30 -- ni más (perdería cobertura frontal útil) ni menos
+# (dejaría pasar auto-detecciones del chasis).
+LIDAR_BLIND_ARC_CENTER_DEG_DEFAULT = 180.0
+LIDAR_BLIND_ARC_HALFWIDTH_DEG_DEFAULT = 60.0
+
+# Costo de aborto cuando el E-stop se dispara ANTES de que corra cualquier
+# prueba (run_once no alcanza a ejecutar ni P1). Es mayor que un PENALTY_TO
+# simple porque representa el fallo simultáneo de las tres pruebas P1+P2+P3,
+# no la falla de un solo segmento dentro de una prueba (que ya usa
+# PENALTY_TO tal cual, sin multiplicar, dentro de _run_testN).
+EMERGENCY_ABORT_COST = PENALTY_TO * 3
+
 
 class HardwareBatteryEvaluatorEnc(Node):
     def __init__(self):
@@ -67,7 +153,19 @@ class HardwareBatteryEvaluatorEnc(Node):
 
         # ── ESTADO GLOBAL DE SEGURIDAD (E-STOP) Y TECLADO ──
         self._e_stop = False
-        self._waiting_for_enter = False 
+        self._waiting_for_enter = False
+        self._kb_thread_running = False   # FIX #3c: bandera explícita de vida del hilo
+
+        # ── Arco ciego del LIDAR bloqueado por las tarjetas de control ──────
+        # Parámetros ROS para poder calibrar sin recompilar. Ver nota de
+        # diseño junto a LIDAR_BLIND_ARC_*_DEFAULT sobre por qué esto es
+        # obligatorio (no opcional) en este chasis.
+        self.declare_parameter('lidar_blind_arc_center_deg', LIDAR_BLIND_ARC_CENTER_DEG_DEFAULT)
+        self.declare_parameter('lidar_blind_arc_halfwidth_deg', LIDAR_BLIND_ARC_HALFWIDTH_DEG_DEFAULT)
+        self._blind_arc_center = math.radians(
+            self.get_parameter('lidar_blind_arc_center_deg').value)
+        self._blind_arc_half = math.radians(
+            self.get_parameter('lidar_blind_arc_halfwidth_deg').value)
 
         # ── Estado encoder (FUENTE DE CONTROL) ──
         self._enc_pose = Pose2D()
@@ -95,46 +193,116 @@ class HardwareBatteryEvaluatorEnc(Node):
         self.create_subscription(Odometry, "/odom_encoder", self._encoder_odom_cb, qos_profile_sensor_data, callback_group=cbg)
         self.create_subscription(LaserScan, "/scan", self._scan_cb, qos_profile_sensor_data, callback_group=cbg)
 
-        threading.Thread(target=self._keyboard_monitor, daemon=True).start()
+        self._kb_thread = threading.Thread(target=self._keyboard_monitor, daemon=True)
+        self._kb_thread.start()
 
         self.get_logger().info("HardwareBatteryEvaluatorEnc listo.")
-        self.get_logger().warn("CONTROL: Encoders. E-STOP ACTIVO (LIDAR < 0.30m o Ctrl+X).")
+        self.get_logger().warn(
+            f"CONTROL: Encoders. E-STOP AUTOMÁTICO por LIDAR SOLO cubre el "
+            f"cono frontal (±{math.degrees(E_STOP_HALF_ANGLE):.0f}°) < "
+            f"{E_STOP_MIN_RANGE:.2f}m. Arco ciego enmascarado: "
+            f"{math.degrees(self._blind_arc_center):.0f}°±"
+            f"{math.degrees(self._blind_arc_half):.0f}°. "
+            f"LA PARTE TRASERA NO TIENE SENSADO AUTOMÁTICO -- cada movimiento "
+            f"hacia atrás pedirá confirmación visual manual. Ctrl+X sigue "
+            f"disponible en cualquier momento.")
 
-    # ── 🚨 SEGURIDAD Y PARO DE EMERGENCIA 🚨 ──
+    # ──  SEGURIDAD Y PARO DE EMERGENCIA  ──
     def _scan_cb(self, msg: LaserScan):
-        if self._e_stop: return
+        if self._e_stop:
+            return
+        if not msg.ranges:   # FIX #7 — mensaje vacío, nada que revisar
+            return
+
         angle_min = msg.angle_min
         angle_inc = msg.angle_increment
         for i, r in enumerate(msg.ranges):
-            if math.isinf(r) or math.isnan(r) or r < msg.range_min: continue
+            if math.isinf(r) or math.isnan(r) or r < msg.range_min:
+                continue
+            if r >= E_STOP_MIN_RANGE:
+                continue
+
             angle = angle_min + i * angle_inc
             angle = (angle + math.pi) % (2 * math.pi) - math.pi
-            if abs(angle) < 0.52:
-                if r < 0.30: 
-                    self.get_logger().error(f"🛑 ¡COLISIÓN INMINENTE! Obstáculo a {r:.2f}m. ACTIVANDO E-STOP 🛑")
-                    self._e_stop = True
-                    self._stop()
-                    break
+
+            # Enmascarar el arco bloqueado por las tarjetas de control ANTES
+            # de cualquier evaluación: esas lecturas son auto-detección del
+            # propio chasis, no del entorno, y deben ignorarse por completo
+            # (ni siquiera loguearse como "no coincide con el frente" --
+            # simplemente no participan del chequeo).
+            if abs(self._angle_diff(angle, self._blind_arc_center)) < self._blind_arc_half:
+                continue
+
+            # El E-stop automático por LIDAR SOLO vigila el cono frontal --
+            # ver nota de diseño al inicio del módulo sobre por qué la parte
+            # trasera no puede monitorearse con este sensor en este chasis.
+            in_front = abs(self._angle_diff(angle, E_STOP_FRONT_CENTER)) < E_STOP_HALF_ANGLE
+            if in_front:
+                self.get_logger().error(
+                    f"🛑 ¡COLISIÓN INMINENTE (FRONTAL)! Obstáculo a {r:.2f}m. "
+                    f"ACTIVANDO E-STOP 🛑")
+                self._e_stop = True
+                self._stop()
+                break
+
+    @staticmethod
+    def _angle_diff(a: float, b: float) -> float:
+        """Diferencia angular normalizada a (-pi, pi], para comparar contra
+        un centro de cono sin problemas de wraparound en ±pi."""
+        d = a - b
+        return (d + math.pi) % (2 * math.pi) - math.pi
 
     def _keyboard_monitor(self):
-        settings = termios.tcgetattr(sys.stdin)
+        # FIX #3a/#4 — proteger contra stdin no interactivo (p. ej. lanzado
+        # desde un launch.py sin terminal). Sin esto, termios.tcgetattr()
+        # lanza una excepción que mata el hilo daemon en silencio y el
+        # Ctrl+X deja de funcionar sin ningún aviso.
+        if not sys.stdin.isatty():
+            self.get_logger().warn(
+                "stdin no es una terminal interactiva — Ctrl+X deshabilitado "
+                "en esta sesión. El E-stop por LIDAR sigue activo.")
+            return
+
+        try:
+            settings = termios.tcgetattr(sys.stdin)
+        except termios.error as e:
+            self.get_logger().warn(f"No se pudo leer configuración de terminal: {e}")
+            return
+
+        self._kb_thread_running = True
         try:
             tty.setcbreak(sys.stdin.fileno())
-            while rclpy.ok():
+            while rclpy.ok() and self._kb_thread_running:
                 dr, _, _ = select.select([sys.stdin], [], [], 0.1)
                 if dr:
                     key = sys.stdin.read(1)
                     if key == '\x18':  # Ctrl+X
-                        self.get_logger().error("🛑 ¡PARO DE EMERGENCIA MANUAL (Ctrl+X) ACTIVADO! 🛑\r")
+                        self.get_logger().error(
+                            "🛑 ¡PARO DE EMERGENCIA MANUAL (Ctrl+X) ACTIVADO! 🛑\r")
                         self._e_stop = True
-                        self._waiting_for_enter = False 
+                        self._waiting_for_enter = False
                         self._stop()
                     elif key == '\x03':  # Ctrl+C
                         break
                     elif key in ('\r', '\n') and self._waiting_for_enter:
                         self._waiting_for_enter = False
         finally:
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, settings)
+            # FIX #3b — restauración local por si el hilo termina por su
+            # propia cuenta (break normal); la restauración "de emergencia"
+            # ante muerte abrupta del proceso vive en main()/restore_terminal().
+            try:
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, settings)
+            except termios.error:
+                pass
+            self._kb_thread_running = False
+
+    def stop_keyboard_monitor(self):
+        """Señaliza al hilo de teclado que termine y espera brevemente a
+        que lo haga, para poder unirse a él de forma ordenada desde
+        main()."""
+        self._kb_thread_running = False
+        if hasattr(self, "_kb_thread") and self._kb_thread.is_alive():
+            self._kb_thread.join(timeout=0.5)
 
     # ── Odometría por encoders — FUENTE DE CONTROL ────
     def _encoder_odom_cb(self, msg: Odometry):
@@ -155,8 +323,8 @@ class HardwareBatteryEvaluatorEnc(Node):
                 ex = self._itae_target_enc.x - self._enc_pose.x
                 ey = self._itae_target_enc.y - self._enc_pose.y
                 err = math.hypot(ex, ey)
-                t_real = now - self._start_eval_t   
-                
+                t_real = now - self._start_eval_t
+
                 self._itae_accum += t_real * err * dt
 
                 if self._seg_log_enc is not None:
@@ -213,10 +381,12 @@ class HardwareBatteryEvaluatorEnc(Node):
                 self._seg_log.yaw_real.append(self._pose.yaw)
 
     def _get_pose(self) -> Pose2D:
-        with self._lock: return self._pose.copy()
+        with self._lock:
+            return self._pose.copy()
 
     def _get_pose_enc(self) -> Pose2D:
-        with self._lock: return self._enc_pose.copy()
+        with self._lock:
+            return self._enc_pose.copy()
 
     def _fix_origin(self):
         with self._lock:
@@ -224,12 +394,19 @@ class HardwareBatteryEvaluatorEnc(Node):
             self._origin_enc = self._enc_pose.copy()
 
     def _pose_rel(self) -> Pose2D:
-        with self._lock: return Pose2D(self._pose.x - self._origin.x, self._pose.y - self._origin.y, self._pose.yaw)
+        with self._lock:
+            return Pose2D(self._pose.x - self._origin.x,
+                          self._pose.y - self._origin.y,
+                          self._pose.yaw)
 
     def _pose_rel_enc(self) -> Pose2D:
-        with self._lock: return Pose2D(self._enc_pose.x - self._origin_enc.x, self._enc_pose.y - self._origin_enc.y, self._enc_pose.yaw)
+        with self._lock:
+            return Pose2D(self._enc_pose.x - self._origin_enc.x,
+                          self._enc_pose.y - self._origin_enc.y,
+                          self._enc_pose.yaw)
 
-    def _start_itae(self, target_enc: Pose2D, seg_log_enc: SegmentLog = None, target_rf2o: Pose2D = None, seg_log_rf2o: SegmentLog = None):
+    def _start_itae(self, target_enc: Pose2D, seg_log_enc: SegmentLog = None,
+                     target_rf2o: Pose2D = None, seg_log_rf2o: SegmentLog = None):
         with self._lock:
             self._itae_target_enc = target_enc.copy()
             self._itae_accum = 0.0
@@ -252,12 +429,54 @@ class HardwareBatteryEvaluatorEnc(Node):
             self._seg_log_enc = None
             return self._itae_accum
 
-    def _reset_encoder_odom(self):
-        if not self._enc_reset_cli.wait_for_service(timeout_sec=2.0): return
+    def _reset_encoder_odom(self) -> bool:
+        if not self._enc_reset_cli.wait_for_service(timeout_sec=2.0):
+            self.get_logger().error("Timeout: Servicio ~/reset_pose no disponible.")
+            return False
+            
         fut = self._enc_reset_cli.call_async(Empty.Request())
         t0 = time.time()
         while not fut.done() and time.time() - t0 < 2.0:
             time.sleep(0.05)
+            
+        if not fut.done():
+            self.get_logger().error("Fallo crítico: El bridge no resolvió el reset a tiempo.")
+            return False
+            
+        return True
+        
+    def _wait_for_enter(self, prompt: str) -> bool:
+        """Bloquea hasta que el operador presione ENTER (vía el hilo de
+        teclado) o se dispare el E-stop. Devuelve True si se completó con
+        ENTER, False si fue interrumpido por E-stop -- el caller SIEMPRE
+        debe revisar el valor de retorno (o self._e_stop directamente)
+        antes de proceder, en vez de asumir que la espera terminó de forma
+        normal."""
+        print(f"\n>>> {prompt}\r")
+        self._waiting_for_enter = True
+        while self._waiting_for_enter and rclpy.ok() and not self._e_stop:
+            time.sleep(0.1)
+        if self._e_stop:
+            self._waiting_for_enter = False
+            return False
+        return True
+
+    def _confirm_rear_clear(self) -> bool:
+        """Confirmación visual MANUAL antes de cualquier movimiento hacia
+        atrás. El LIDAR no puede sustituir esto en este chasis -- ver nota
+        de diseño junto a LIDAR_BLIND_ARC_*_DEFAULT. Devuelve False si el
+        E-stop interrumpió la espera (en cuyo caso el _drive() que sigue
+        detectará self._e_stop y se saltará el movimiento de todos modos,
+        pero se revisa aquí también para loggear la causa con claridad)."""
+        ok = self._wait_for_enter(
+            "PARTE TRASERA: verifica visualmente que está despejada "
+            "(el LIDAR NO la cubre en este chasis). Presiona ENTER para "
+            "iniciar el movimiento hacia atrás...")
+        if not ok:
+            self.get_logger().warn(
+                "Confirmación de parte trasera interrumpida por E-stop — "
+                "el movimiento hacia atrás se omitirá.")
+        return ok
 
     def _manual_reset(self):
         self._stop()
@@ -268,7 +487,14 @@ class HardwareBatteryEvaluatorEnc(Node):
         while self._waiting_for_enter and rclpy.ok() and not self._e_stop:
             time.sleep(0.1)
         time.sleep(0.5)
-        self._reset_encoder_odom()
+        
+        # EL FIX: Aborto seguro si el reset falla
+        reset_exitoso = self._reset_encoder_odom()
+        if not reset_exitoso:
+            self.get_logger().error("ABORTANDO: No se puede garantizar un yaw inicial limpio por fallo de reset.")
+            self._e_stop = True  # Esto interrumpe automáticamente la batería de pruebas
+            return
+            
         time.sleep(0.15)   
         self._fix_origin()
 
@@ -280,8 +506,10 @@ class HardwareBatteryEvaluatorEnc(Node):
             return Pose2D(p0.x - math.sin(p0.yaw)*dist_m, p0.y + math.cos(p0.yaw)*dist_m, p0.yaw)
 
     def _send(self, vx=0.0, vy=0.0, wz=0.0):
-        if self._e_stop: vx = vy = wz = 0.0 
-        with self._lock: self._current_vref = (vx, vy, wz)
+        if self._e_stop:
+            vx = vy = wz = 0.0
+        with self._lock:
+            self._current_vref = (vx, vy, wz)
         msg = Twist()
         msg.linear.x, msg.linear.y, msg.angular.z = float(vx), float(vy), float(wz)
         self._cmd_pub.publish(msg)
@@ -290,12 +518,12 @@ class HardwareBatteryEvaluatorEnc(Node):
         self._send()
 
     def _drive(self, dist_m, axis, vx=0.0, vy=0.0, timeout=TIMEOUT_MOVE, seg_name=""):
-        if self._e_stop: 
+        if self._e_stop:
             self.get_logger().warn(f"[{seg_name}] Omitido debido a Paro de Emergencia Activo.")
             return 0.0, 0.0, False, SegmentLog(name=seg_name+"_enc"), SegmentLog(name=seg_name)
-        
+
         self.get_logger().info(f"[{seg_name}] Iniciando movimiento: obj={dist_m:.2f}m, vel={vx:.2f}m/s")
-        
+
         p0_enc = self._get_pose_enc()
         target_enc = self._compute_target(p0_enc, dist_m, axis)
         p0 = self._get_pose()
@@ -307,12 +535,12 @@ class HardwareBatteryEvaluatorEnc(Node):
         t0, ok, aborted = time.time(), False, False
 
         while time.time() - t0 < timeout:
-            if self._e_stop: 
+            if self._e_stop:
                 self.get_logger().error(f"[{seg_name}] Movimiento abortado por E-STOP en plena ejecución.")
                 aborted = True
                 break
 
-            p_enc = self._get_pose_enc() 
+            p_enc = self._get_pose_enc()
             dx, dy = p_enc.x - p0_enc.x, p_enc.y - p0_enc.y
             traveled = (dx*math.cos(p0_enc.yaw) + dy*math.sin(p0_enc.yaw) if axis == "x" else -dx*math.sin(p0_enc.yaw) + dy*math.cos(p0_enc.yaw))
             lateral_dev = math.hypot(dx, dy) - abs(traveled)
@@ -339,7 +567,7 @@ class HardwareBatteryEvaluatorEnc(Node):
         return itae, elapsed, (ok and not aborted), slog_enc, slog
 
     def _rotate(self, angle_rad, timeout=TIMEOUT_ROT, seg_name=""):
-        if self._e_stop: 
+        if self._e_stop:
             self.get_logger().warn(f"[{seg_name}] Giro omitido por Paro de Emergencia.")
             return 0.0, False, SegmentLog(name=seg_name+"_enc"), 0.0, SegmentLog(name=seg_name)
 
@@ -360,12 +588,12 @@ class HardwareBatteryEvaluatorEnc(Node):
         self._start_itae(target_enc, slog_enc, target, slog)
 
         while time.time() - t0 < timeout:
-            if self._e_stop: 
+            if self._e_stop:
                 self.get_logger().error(f"[{seg_name}] Giro abortado por E-STOP en ejecución.")
                 ok = False
                 break
 
-            p_enc = self._get_pose_enc() 
+            p_enc = self._get_pose_enc()
             diff = (goal_yaw_enc - p_enc.yaw + math.pi) % (2*math.pi) - math.pi
             if abs(diff) <= YAW_TOL:
                 self.get_logger().info(f"[{seg_name}] Giro completado exitosamente. Error final: {math.degrees(diff):.2f}°")
@@ -394,7 +622,9 @@ class HardwareBatteryEvaluatorEnc(Node):
         return abs(diff), ok, slog_enc, elapsed, slog
 
     def _set_pid(self, kp, ki, kd):
-        if not self._pid_cli.wait_for_service(timeout_sec=5.0): return
+        if not self._pid_cli.wait_for_service(timeout_sec=5.0):
+            self.get_logger().warn(f"{BRIDGE_PARAM_SERVICE} no disponible — PID no actualizado.")
+            return
         def _p(n, v): return Parameter(name=n, value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(v)))
         req = SetParameters.Request()
         req.parameters = [_p("kp", kp), _p("ki", ki), _p("kd", kd)]
@@ -466,6 +696,13 @@ class HardwareBatteryEvaluatorEnc(Node):
         self.get_logger().info("── P1: línea recta adelante-atrás ──")
         self._manual_reset()
         i1, t1, ok1, s1e, s1 = self._drive(DIST_X, "x", vx=+VX_REF, seg_name="P1_adelante")
+
+        # El LIDAR no cubre la parte trasera en este chasis (ver nota de
+        # diseño al inicio del módulo) -- se pide confirmación visual del
+        # operador antes de mover el robot hacia atrás. Si el E-stop se
+        # dispara durante esta espera, _drive() detectará self._e_stop y
+        # devolverá el resultado "omitido" sin intentar moverse.
+        self._confirm_rear_clear()
         i2, t2, ok2, s2e, s2 = self._drive(-DIST_X, "x", vx=-VX_REF, seg_name="P1_atras")
 
         rel_enc = self._pose_rel_enc()
@@ -520,11 +757,17 @@ class HardwareBatteryEvaluatorEnc(Node):
         time.sleep(0.3)
         self._start_arm()
         time.sleep(0.5)
-        
-        # NUEVO: Pre-inicializamos por si ocurre un E-STOP, evitando que Python crashee
-        c1 = c2 = c3 = PENALTY_TO * 3
-        segs1e = segs2e = segs3e = [SegmentLog(name="E-STOP")]
-        segs1 = segs2 = segs3 = [SegmentLog(name="E-STOP")]
+
+        # FIX #4 — cada prueba obtiene su propia lista/SegmentLog
+        # independiente en vez de aliasar el mismo objeto tres veces
+        # (segs1e = segs2e = segs3e = [...] compartía la MISMA lista).
+        c1 = c2 = c3 = EMERGENCY_ABORT_COST
+        segs1e, segs2e, segs3e = ([SegmentLog(name="E-STOP")],
+                                   [SegmentLog(name="E-STOP")],
+                                   [SegmentLog(name="E-STOP")])
+        segs1, segs2, segs3 = ([SegmentLog(name="E-STOP")],
+                                [SegmentLog(name="E-STOP")],
+                                [SegmentLog(name="E-STOP")])
         err1 = err2 = err3 = {"encoder_m": 0.0, "rf2o_m": 0.0}
 
         try:
@@ -538,13 +781,15 @@ class HardwareBatteryEvaluatorEnc(Node):
             self._stop_arm()
             if self._e_stop:
                 self.get_logger().error("🛑 CANCELANDO BATERÍA: VARIABLES GUARDADAS DE EMERGENCIA 🛑")
-                
+
         fitness = W1*c1 + W2*c2 + W3*c3
         return fitness, (c1, c2, c3), (segs1e, segs2e, segs3e), (segs1, segs2, segs3), (err1, err2, err3)
+
 
 def _seg_to_dict(s: SegmentLog) -> dict:
     if not s: return {}
     return {"name": s.name, "t": s.t, "vx_ref": s.vx_ref, "vy_ref": s.vy_ref, "wz_ref": s.wz_ref, "vx_real": s.vx_real, "vy_real": s.vy_real, "wz_real": s.wz_real, "pos_err": s.pos_err, "x_ref": s.x_ref, "y_ref": s.y_ref, "yaw_ref": s.yaw_ref, "x_real": s.x_real, "y_real": s.y_real, "yaw_real": s.yaw_real}
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -572,7 +817,7 @@ def main(args=None):
         node.get_logger().info(f"=== Batería hardware — {label} — Kp={kp} Ki={ki} Kd={kd} — {reps} reps — CONTROL X ENCODER ===")
         runs = []
         for r in range(reps):
-            if node._e_stop: 
+            if node._e_stop:
                 node.get_logger().error("Ejecución global abortada por seguridad.")
                 break
             node.get_logger().info(f"--- Repetición {r+1}/{reps} ---")
@@ -588,7 +833,7 @@ def main(args=None):
             fitnesses = [r["fitness"] for r in runs]
             mean_fit = sum(fitnesses) / len(fitnesses)
             std_fit = (sum((f-mean_fit)**2 for f in fitnesses) / len(fitnesses)) ** 0.5
-            
+
             def _mean_err(src, tst):
                 vals = [r["final_position_error_m"][tst][src] for r in runs]
                 return sum(vals) / len(vals)
@@ -596,15 +841,23 @@ def main(args=None):
             err_sum = {t: {"encoder_mean_m": _mean_err("encoder_m", t), "rf2o_mean_m": _mean_err("rf2o_m", t)} for t in ("test1", "test2", "test3")}
 
             results = {
-                "label": label, "kp": kp, "ki": ki, "kd": kd, "reps": reps, "mean_fitness": mean_fit, "std_fitness": std_fit, "final_position_error_summary": err_sum, "note": "Control usa exclusivamente /odom_encoder. LIDAR pasivo. E-Stop integrado.", "runs": runs,
+                "label": label, "kp": kp, "ki": ki, "kd": kd, "reps": reps, "mean_fitness": mean_fit, "std_fitness": std_fit,
+                "final_position_error_summary": err_sum,
+                "note": "Control usa exclusivamente /odom_encoder. LIDAR pasivo (solo registro + E-stop frontal/trasero). E-Stop integrado.",
+                "runs": runs,
             }
             out_path = os.path.abspath(f"{label}_{OUT_JSON}")
             with open(out_path, "w") as f: json.dump(results, f, indent=2)
             node.get_logger().info(f"=== Resultados guardados en {out_path} ===")
     finally:
+        # FIX #3b — restauración de terminal garantizada independientemente
+        # de cómo haya terminado el hilo de teclado (join con timeout +
+        # el propio finally del hilo como respaldo).
+        node.stop_keyboard_monitor()
         executor.shutdown()
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == "__main__":
     main()

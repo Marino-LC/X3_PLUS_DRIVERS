@@ -31,9 +31,9 @@ DIST_RETURN = 0.30
 ROT_ANGLE   = math.pi / 2
 
 # ── Velocidades de referencia ─────────────────────────────────────────────
-VX_REF = 0.4
+VX_REF = 1.0
 VY_REF = 0.10
-WZ_REF = 0.2
+WZ_REF = 1.0
 
 # ── Lazo de control / tolerancias ─────────────────────────────────────────
 CTRL_DT      = 0.05
