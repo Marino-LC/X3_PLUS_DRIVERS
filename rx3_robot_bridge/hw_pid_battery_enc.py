@@ -155,7 +155,13 @@ class HardwareBatteryEvaluatorEnc(Node):
         self._e_stop = False
         self._waiting_for_enter = False
         self._kb_thread_running = False   # FIX #3c: bandera explícita de vida del hilo
-
+            
+        # Grabador continuo independiente del flag de medición:
+        # En __init__:
+        self._cont_log_enc = None
+        self._cont_log_rf2o = None
+        self._recording_continuous = False
+        self._continuous_start_t = 0.0
         # ── Arco ciego del LIDAR bloqueado por las tarjetas de control ──────
         # Parámetros ROS para poder calibrar sin recompilar. Ver nota de
         # diseño junto a LIDAR_BLIND_ARC_*_DEFAULT sobre por qué esto es
@@ -344,6 +350,23 @@ class HardwareBatteryEvaluatorEnc(Node):
                     self._seg_log_enc.y_real.append(self._enc_pose.y)
                     self._seg_log_enc.yaw_real.append(self._enc_pose.yaw)
 
+                if self._recording_continuous and self._cont_log_enc is not None:
+                    t_rel = time.time() - self._continuous_start_t
+                    vref_x, vref_y, vref_wz = self._current_vref
+                    cl = self._cont_log_enc
+                    cl.t.append(t_rel)
+                    cl.vx_ref.append(vref_x); cl.vy_ref.append(vref_y); cl.wz_ref.append(vref_wz)
+                    cl.vx_real.append(vx); cl.vy_real.append(vy); cl.wz_real.append(wz)
+                    ex = self._itae_target_enc.x - self._enc_pose.x
+                    ey = self._itae_target_enc.y - self._enc_pose.y
+                    cl.pos_err.append(math.hypot(ex, ey))
+                    cl.x_ref.append(self._itae_target_enc.x)
+                    cl.y_ref.append(self._itae_target_enc.y)
+                    cl.yaw_ref.append(self._yaw_ref_live_enc)
+                    cl.x_real.append(self._enc_pose.x)
+                    cl.y_real.append(self._enc_pose.y)
+                    cl.yaw_real.append(self._enc_pose.yaw)
+
     # ── Odometría rf2o (LIDAR) — SOLO REGISTRO ──
     def _odom_cb(self, msg: Odometry):
         q = msg.pose.pose.orientation
@@ -379,6 +402,37 @@ class HardwareBatteryEvaluatorEnc(Node):
                 self._seg_log.x_real.append(self._pose.x)
                 self._seg_log.y_real.append(self._pose.y)
                 self._seg_log.yaw_real.append(self._pose.yaw)
+            
+            
+            # ── Bloque nuevo: grabación continua, SIEMPRE que esté activa ──
+            if self._recording_continuous and self._cont_log_rf2o is not None:
+                t_rel = time.time() - self._continuous_start_t
+                vref_x, vref_y, vref_wz = self._current_vref
+                cl = self._cont_log_rf2o          # <-- aquí estaba el error, era self._pose
+                cl.t.append(t_rel)
+                cl.vx_ref.append(vref_x); cl.vy_ref.append(vref_y); cl.wz_ref.append(vref_wz)
+                cl.vx_real.append(vx);    cl.vy_real.append(vy);    cl.wz_real.append(wz)
+                ex = self._itae_target.x - self._pose.x
+                ey = self._itae_target.y - self._pose.y
+                cl.pos_err.append(math.hypot(ex, ey))
+                cl.x_ref.append(self._itae_target.x)
+                cl.y_ref.append(self._itae_target.y)
+                cl.yaw_ref.append(self._yaw_ref_live)
+                cl.x_real.append(self._pose.x)
+                cl.y_real.append(self._pose.y)
+                cl.yaw_real.append(self._pose.yaw)
+    def _start_continuous_recording(self, name: str):
+        self._cont_log_enc = SegmentLog(name=name + "_enc")
+        self._cont_log_rf2o = SegmentLog(name=name + "_rf2o")
+        self._continuous_start_t = time.time()
+        self._recording_continuous = True
+
+    def _stop_continuous_recording(self):
+        self._recording_continuous = False
+        log_enc, log_rf2o = self._cont_log_enc, self._cont_log_rf2o
+        self._cont_log_enc = None
+        self._cont_log_rf2o = None
+        return log_enc, log_rf2o
 
     def _get_pose(self) -> Pose2D:
         with self._lock:
@@ -695,6 +749,7 @@ class HardwareBatteryEvaluatorEnc(Node):
     def _run_test1(self):
         self.get_logger().info("── P1: línea recta adelante-atrás ──")
         self._manual_reset()
+        self._start_continuous_recording("P1")
         i1, t1, ok1, s1e, s1 = self._drive(DIST_X, "x", vx=+VX_REF, seg_name="P1_adelante")
 
         # El LIDAR no cubre la parte trasera en este chasis (ver nota de
@@ -704,6 +759,7 @@ class HardwareBatteryEvaluatorEnc(Node):
         # devolverá el resultado "omitido" sin intentar moverse.
         self._confirm_rear_clear()
         i2, t2, ok2, s2e, s2 = self._drive(-DIST_X, "x", vx=-VX_REF, seg_name="P1_atras")
+        cont_enc, cont_rf2o = self._stop_continuous_recording()
 
         rel_enc = self._pose_rel_enc()
         err_f_enc = math.hypot(rel_enc.x, rel_enc.y)
@@ -714,13 +770,17 @@ class HardwareBatteryEvaluatorEnc(Node):
         cost = 0.60*(i1+i2)/ITAE_REF + 0.30*(t1+t2)/TIME_REF + 0.10*err_f_enc/POS_TOL
         if not ok1 or not ok2: cost += PENALTY_TO
         self.get_logger().info(f"   ITAE={i1+i2:.4f} cost={cost:.4f} err_f_encoder={err_f_enc:.3f}m")
-        return cost, [s1e, s2e], [s1, s2], {"encoder_m": err_f_enc, "rf2o_m": err_f}
+        return cost, [s1e, s2e], [s1, s2], {"encoder_m": err_f_enc, "rf2o_m": err_f}, cont_enc, cont_rf2o
 
     def _run_test2(self):
         self.get_logger().info("── P2: rotación pura +90°/-90° ──")
         self._manual_reset()
+
+        self._start_continuous_recording("P2")
         e1, ok1, s1e, t1, s1 = self._rotate(+ROT_ANGLE, seg_name="P2_giro_horario")
         e2, ok2, s2e, t2, s2 = self._rotate(-ROT_ANGLE, seg_name="P2_giro_antihorario")
+
+        cont_enc, cont_rf2o = self._stop_continuous_recording()
 
         rel_enc = self._pose_rel_enc()
         err_f_enc = math.hypot(rel_enc.x, rel_enc.y)
@@ -731,14 +791,20 @@ class HardwareBatteryEvaluatorEnc(Node):
         cost = 0.55*(e1+e2)/(2*YAW_TOL) + 0.25*(t1+t2)/TIME_REF + 0.20*err_f_enc/POS_TOL
         if not ok1 or not ok2: cost += PENALTY_TO
         self.get_logger().info(f"   err_yaw={math.degrees(e1+e2):.1f}° cost={cost:.4f} err_f_encoder={err_f_enc:.3f}m")
-        return cost, [s1e, s2e], [s1, s2], {"encoder_m": err_f_enc, "rf2o_m": err_f}
+        return cost, [s1e, s2e], [s1, s2], {"encoder_m": err_f_enc, "rf2o_m": err_f}, cont_enc, cont_rf2o
 
     def _run_test3(self):
         self.get_logger().info("── P3: avance + giro + regreso ──")
         self._manual_reset()
+
+        self._start_continuous_recording("P1")
+
+
         i1, t1, ok1, s1e, s1 = self._drive(DIST_X, "x", vx=+VX_REF, seg_name="P3_adelante")
         ey, okr, sre, tr, sr = self._rotate(-ROT_ANGLE, seg_name="P3_giro")
         i2, t2, ok2, s2e, s2 = self._drive(DIST_RETURN, "x", vx=+VX_REF, seg_name="P3_regreso")
+
+        cont_enc, cont_rf2o = self._stop_continuous_recording()
 
         rel_enc = self._pose_rel_enc()
         err_f_enc = math.hypot(rel_enc.x, rel_enc.y)
@@ -750,7 +816,7 @@ class HardwareBatteryEvaluatorEnc(Node):
         cost = (0.45*(i1+i2)/ITAE_REF + 0.20*(t1+t2)/TIME_REF + 0.15*ey/YAW_TOL + 0.20*err_f_enc/POS_TOL)
         if not ok1 or not ok2 or not okr: cost += PENALTY_TO
         self.get_logger().info(f"   err_yaw={math.degrees(ey):.1f}° cost={cost:.4f} err_f_encoder={err_f_enc:.3f}m")
-        return cost, [s1e, sre, s2e], [s1, sr, s2], {"encoder_m": err_f_enc, "rf2o_m": err_f}
+        return cost, [s1e, sre, s2e], [s1, sr, s2], {"encoder_m": err_f_enc, "rf2o_m": err_f}, cont_enc, cont_rf2o
 
     def run_once(self, kp, ki, kd):
         self._set_pid(kp, ki, kd)
@@ -772,24 +838,29 @@ class HardwareBatteryEvaluatorEnc(Node):
 
         try:
             if not self._e_stop:
-                c1, segs1e, segs1, err1 = self._run_test1()
+                c1, segs1e, segs1, err1, cont1e, cont1r = self._run_test1()
             if not self._e_stop:
-                c2, segs2e, segs2, err2 = self._run_test2()
+                c2, segs2e, segs2, err2, cont2e, cont2r = self._run_test2()
             if not self._e_stop:
-                c3, segs3e, segs3, err3 = self._run_test3()
+                c3, segs3e, segs3, err3, cont3e, cont3r = self._run_test3()
         finally:
             self._stop_arm()
             if self._e_stop:
                 self.get_logger().error("🛑 CANCELANDO BATERÍA: VARIABLES GUARDADAS DE EMERGENCIA 🛑")
 
         fitness = W1*c1 + W2*c2 + W3*c3
-        return fitness, (c1, c2, c3), (segs1e, segs2e, segs3e), (segs1, segs2, segs3), (err1, err2, err3)
+        return fitness, (c1, c2, c3), (segs1e, segs2e, segs3e), (segs1, segs2, segs3), (err1, err2, err3),[cont1e, cont2e, cont3e], [cont1r, cont2r, cont3r]
 
 
-def _seg_to_dict(s: SegmentLog) -> dict:
-    if not s: return {}
-    return {"name": s.name, "t": s.t, "vx_ref": s.vx_ref, "vy_ref": s.vy_ref, "wz_ref": s.wz_ref, "vx_real": s.vx_real, "vy_real": s.vy_real, "wz_real": s.wz_real, "pos_err": s.pos_err, "x_ref": s.x_ref, "y_ref": s.y_ref, "yaw_ref": s.yaw_ref, "x_real": s.x_real, "y_real": s.y_real, "yaw_real": s.yaw_real}
-
+def _seg_to_dict(s):
+    return {
+        "name": s.name, "t": s.t,
+        "vx_ref": s.vx_ref, "vy_ref": s.vy_ref, "wz_ref": s.wz_ref,
+        "vx_real": s.vx_real, "vy_real": s.vy_real, "wz_real": s.wz_real,
+        "pos_err": s.pos_err,
+        "x_ref": s.x_ref, "y_ref": s.y_ref, "yaw_ref": s.yaw_ref,
+        "x_real": s.x_real, "y_real": s.y_real, "yaw_real": s.yaw_real,
+    }
 
 def main(args=None):
     rclpy.init(args=args)
@@ -821,7 +892,7 @@ def main(args=None):
                 node.get_logger().error("Ejecución global abortada por seguridad.")
                 break
             node.get_logger().info(f"--- Repetición {r+1}/{reps} ---")
-            fitness, costs, segs_enc, segs, errs = node.run_once(kp, ki, kd)
+            fitness, costs, segs_enc, segs, errs, conts_enc, conts_rf2o  = node.run_once(kp, ki, kd)
             runs.append({
                 "rep": r, "fitness": fitness, "cost_p1": costs[0], "cost_p2": costs[1], "cost_p3": costs[2],
                 "final_position_error_m": {"test1": errs[0], "test2": errs[1], "test3": errs[2]},
@@ -845,6 +916,26 @@ def main(args=None):
                 "final_position_error_summary": err_sum,
                 "note": "Control usa exclusivamente /odom_encoder. LIDAR pasivo (solo registro + E-stop frontal/trasero). E-Stop integrado.",
                 "runs": runs,
+                 "segments_encoder": {
+                "test1": [_seg_to_dict(s) for s in segs_enc[0]],
+                "test2": [_seg_to_dict(s) for s in segs_enc[1]],
+                "test3": [_seg_to_dict(s) for s in segs_enc[2]],
+                },
+                "segments_rf2o": {
+                    "test1": [_seg_to_dict(s) for s in segs[0]],
+                    "test2": [_seg_to_dict(s) for s in segs[1]],
+                    "test3": [_seg_to_dict(s) for s in segs[2]],
+                },
+                "segments_continuous_encoder": {
+                    "test1": _seg_to_dict(conts_enc[0]),
+                    "test2": _seg_to_dict(conts_enc[1]),
+                    "test3": _seg_to_dict(conts_enc[2]),
+                },
+                "segments_continuous_rf2o": {
+                    "test1": _seg_to_dict(conts_rf2o[0]),
+                    "test2": _seg_to_dict(conts_rf2o[1]),
+                    "test3": _seg_to_dict(conts_rf2o[2]),
+                },
             }
             out_path = os.path.abspath(f"{label}_{OUT_JSON}")
             with open(out_path, "w") as f: json.dump(results, f, indent=2)
