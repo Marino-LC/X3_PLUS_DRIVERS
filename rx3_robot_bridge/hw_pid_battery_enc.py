@@ -824,17 +824,32 @@ class HardwareBatteryEvaluatorEnc(Node):
         self._start_arm()
         time.sleep(0.5)
 
-        # FIX #4 — cada prueba obtiene su propia lista/SegmentLog
-        # independiente en vez de aliasar el mismo objeto tres veces
-        # (segs1e = segs2e = segs3e = [...] compartía la MISMA lista).
-        c1 = c2 = c3 = EMERGENCY_ABORT_COST
-        segs1e, segs2e, segs3e = ([SegmentLog(name="E-STOP")],
-                                   [SegmentLog(name="E-STOP")],
-                                   [SegmentLog(name="E-STOP")])
-        segs1, segs2, segs3 = ([SegmentLog(name="E-STOP")],
-                                [SegmentLog(name="E-STOP")],
-                                [SegmentLog(name="E-STOP")])
-        err1 = err2 = err3 = {"encoder_m": 0.0, "rf2o_m": 0.0}
+        # Cada prueba obtiene sus propios objetos independientes por defecto
+        # — nunca se reutiliza la misma instancia entre P1/P2/P3 ni entre
+        # segs_enc/segs_rf2o/cont_enc/cont_rf2o, para que un E-stop a mitad
+        # de la batería no deje nada sin definir ni comparta estado entre
+        # pruebas que no llegaron a correr.
+        c1, c2, c3 = EMERGENCY_ABORT_COST, EMERGENCY_ABORT_COST, EMERGENCY_ABORT_COST
+
+        segs1e = [SegmentLog(name="E-STOP_P1_enc")]
+        segs2e = [SegmentLog(name="E-STOP_P2_enc")]
+        segs3e = [SegmentLog(name="E-STOP_P3_enc")]
+
+        segs1 = [SegmentLog(name="E-STOP_P1_rf2o")]
+        segs2 = [SegmentLog(name="E-STOP_P2_rf2o")]
+        segs3 = [SegmentLog(name="E-STOP_P3_rf2o")]
+
+        err1 = {"encoder_m": 0.0, "rf2o_m": 0.0}
+        err2 = {"encoder_m": 0.0, "rf2o_m": 0.0}
+        err3 = {"encoder_m": 0.0, "rf2o_m": 0.0}
+
+        cont1e = SegmentLog(name="E-STOP_P1_cont_enc")
+        cont2e = SegmentLog(name="E-STOP_P2_cont_enc")
+        cont3e = SegmentLog(name="E-STOP_P3_cont_enc")
+
+        cont1r = SegmentLog(name="E-STOP_P1_cont_rf2o")
+        cont2r = SegmentLog(name="E-STOP_P2_cont_rf2o")
+        cont3r = SegmentLog(name="E-STOP_P3_cont_rf2o")
 
         try:
             if not self._e_stop:
@@ -843,14 +858,18 @@ class HardwareBatteryEvaluatorEnc(Node):
                 c2, segs2e, segs2, err2, cont2e, cont2r = self._run_test2()
             if not self._e_stop:
                 c3, segs3e, segs3, err3, cont3e, cont3r = self._run_test3()
+        except Exception as e:
+            self.get_logger().error(f"🛑 EXCEPCIÓN DURANTE LA BATERÍA: {e} 🛑")
         finally:
             self._stop_arm()
             if self._e_stop:
                 self.get_logger().error("🛑 CANCELANDO BATERÍA: VARIABLES GUARDADAS DE EMERGENCIA 🛑")
 
         fitness = W1*c1 + W2*c2 + W3*c3
-        return fitness, (c1, c2, c3), (segs1e, segs2e, segs3e), (segs1, segs2, segs3), (err1, err2, err3),[cont1e, cont2e, cont3e], [cont1r, cont2r, cont3r]
-
+        return (fitness, (c1, c2, c3),
+                (segs1e, segs2e, segs3e), (segs1, segs2, segs3),
+                (err1, err2, err3),
+                [cont1e, cont2e, cont3e], [cont1r, cont2r, cont3r])
 
 def _seg_to_dict(s):
     return {
